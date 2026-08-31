@@ -1,0 +1,39 @@
+name: still
+description: Still desktop local music player.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  intl: ^0.20.3
+  just_audio: ^0.10.6
+  just_audio_windows: ^0.2.3
+  metadata_god: ^1.1.0
+  flutter_rust_bridge: 2.11.1
+  flutter_riverpod: ^2.6.1
+  drift: ^2.28.1
+  shared_preferences: ^2.5.3
+  path_provider: ^2.1.5
+  window_manager: ^0.4.3
+  lpinyin: ^2.0.3
+  desktop_drop: ^0.8.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  shaders:
+    - assets/shaders/snow.frag
+    - assets/shaders/fog.frag
+    - assets/shaders/raindrop.frag
+    - assets/shaders/fluid_background.frag
