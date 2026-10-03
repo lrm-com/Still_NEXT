@@ -4,9 +4,11 @@ import 'audio_engine_backend.dart';
 import 'audio_post_processor.dart';
 import 'audio_track.dart';
 import 'equalizer.dart';
+import 'miniaudio_backend.dart';
 import 'playback_state.dart';
 import 'playback_state_machine.dart';
 import 'replay_gain.dart';
+import 'still_audio.dart';
 import '../playback_memory_service.dart';
 
 class AudioEngineSnapshot {
@@ -69,7 +71,11 @@ class AudioEngineSnapshot {
   static const Object _unchanged = Object();
 }
 
-/// Coordinates queue state, just_audio playback and miniaudio post-processing.
+/// Coordinates queue state, playback backend and audio post-processing.
+///
+/// When a [MiniaudioBackend] is provided, DSP (EQ, replay gain, fade,
+/// spectrum) is handled natively inside `still_audio.dll` and the Dart-side
+/// [AudioPostProcessor] is bypassed.
 class AudioEngine {
   AudioEngine({
     required AudioEngineBackend backend,
@@ -81,7 +87,10 @@ class AudioEngine {
     ShuffleIndexGenerator? shuffleIndexGenerator,
     PlaybackMemoryService? playbackMemory,
   })  : _backend = backend,
-        _postProcessor = postProcessor ?? MiniaudioFfiAudioPostProcessor(),
+        _isNativePlayer = backend is MiniaudioBackend,
+        _postProcessor = backend is MiniaudioBackend
+            ? NoOpAudioPostProcessor()
+            : (postProcessor ?? MiniaudioFfiAudioPostProcessor()),
         _replayGainCalculator = replayGainCalculator,
         _fadeDuration = fadeDuration,
         _playbackMemory = playbackMemory,
@@ -97,6 +106,13 @@ class AudioEngine {
     _spectrumSubscription = _postProcessor.spectrumFrames.listen(
       _handleSpectrumFrame,
     );
+    // When using the native player, wire up spectrum and EQ directly.
+    if (_isNativePlayer) {
+      final native = (backend as MiniaudioBackend).nativePlayer;
+      _nativeSpectrumSub = native.spectrumStream.listen((frame) {
+        _handleSpectrumFrame(SpectrumFrame(frame.magnitudes));
+      });
+    }
   }
 
   final AudioEngineBackend _backend;
@@ -105,11 +121,13 @@ class AudioEngine {
   final Duration _fadeDuration;
   final PlaybackMemoryService? _playbackMemory;
   final PlaybackStateMachine<AudioTrack> _machine;
+  final bool _isNativePlayer;
   final _snapshotController = StreamController<AudioEngineSnapshot>.broadcast(
     sync: true,
   );
   StreamSubscription<BackendEvent>? _backendSubscription;
   StreamSubscription<SpectrumFrame>? _spectrumSubscription;
+  StreamSubscription<StillSpectrumFrame>? _nativeSpectrumSub;
   late AudioEngineSnapshot _snapshot;
   Future<void> _commands = Future<void>.value();
   bool _disposed = false;
@@ -123,7 +141,11 @@ class AudioEngine {
   Future<void> initialize() => _run(() async {
         await _backend.setVolume(_snapshot.volume);
         await _backend.setSpeed(_snapshot.speed);
-        await _postProcessor.setEqualizer(_snapshot.equalizer);
+        if (_isNativePlayer) {
+          await _applyNativeEqualizer(_snapshot.equalizer);
+        } else {
+          await _postProcessor.setEqualizer(_snapshot.equalizer);
+        }
         final track = _machine.state.currentTrack;
         if (track != null) await _applyReplayGain(track);
         await _configureBackendMode(_machine.state.mode);
@@ -134,9 +156,11 @@ class AudioEngine {
     int initialIndex = 0,
     Duration initialPosition = Duration.zero,
     bool autoplay = false,
+    bool restorePosition = false,
   }) =>
       _run(() async {
         final queue = List<AudioTrack>.unmodifiable(tracks);
+        print('[AudioEngine] loadQueue: ${queue.length} tracks, initialIndex: $initialIndex, autoplay: $autoplay, restorePosition: $restorePosition');
         if (queue.isEmpty) {
           _machine.clearQueue();
           await _backend.stop();
@@ -153,7 +177,7 @@ class AudioEngine {
           return;
         }
         _machine.replaceQueue(queue, currentIndex: initialIndex);
-        if (initialPosition == Duration.zero && _playbackMemory != null) {
+        if (restorePosition && initialPosition == Duration.zero && _playbackMemory != null) {
           initialPosition =
               (await _playbackMemory.load(queue[initialIndex].id))?.position ??
                   Duration.zero;
@@ -186,7 +210,7 @@ class AudioEngine {
   Future<void> pause() => _run(() async {
         if (!_machine.state.hasCurrentTrack) return;
         if (_fadeDuration > Duration.zero) {
-          await _postProcessor.fadeOut(_fadeDuration);
+          await _applyFadeOut(_fadeDuration);
         }
         await _backend.pause();
         final track = _machine.state.currentTrack;
@@ -198,7 +222,7 @@ class AudioEngine {
 
   Future<void> stop() => _run(() async {
         if (_fadeDuration > Duration.zero) {
-          await _postProcessor.fadeOut(_fadeDuration);
+          await _applyFadeOut(_fadeDuration);
         }
         await _backend.stop();
         final track = _machine.state.currentTrack;
@@ -274,7 +298,11 @@ class AudioEngine {
       });
 
   Future<void> setEqualizer(EqualizerSettings settings) => _run(() async {
-        await _postProcessor.setEqualizer(settings);
+        if (_isNativePlayer) {
+          await _applyNativeEqualizer(settings);
+        } else {
+          await _postProcessor.setEqualizer(settings);
+        }
         _emit(_snapshot.copyWith(equalizer: settings));
       });
 
@@ -313,13 +341,20 @@ class AudioEngine {
     await _commands;
     await _backendSubscription?.cancel();
     await _spectrumSubscription?.cancel();
+    await _nativeSpectrumSub?.cancel();
     await _backend.dispose();
-    await _postProcessor.dispose();
+    if (!_isNativePlayer) {
+      await _postProcessor.dispose();
+    }
     await _snapshotController.close();
   }
 
   Future<void> _playNow() async {
-    if (!_machine.state.hasCurrentTrack) return;
+    if (!_machine.state.hasCurrentTrack) {
+      print('[AudioEngine] _playNow: no current track');
+      return;
+    }
+    print('[AudioEngine] _playNow: status=${_machine.state.status}, currentIndex=${_machine.state.currentIndex}');
     if (_machine.state.status == PlaybackStatus.completed) {
       await _backend.seek(Duration.zero, index: _machine.state.currentIndex);
       _emit(_snapshot.copyWith(position: Duration.zero));
@@ -327,7 +362,7 @@ class AudioEngine {
     await _backend.play();
     _machine.markPlaying();
     if (_fadeDuration > Duration.zero) {
-      await _postProcessor.fadeIn(_fadeDuration);
+      await _applyFadeIn(_fadeDuration);
     }
     _emit(_snapshot.copyWith(playback: _machine.state));
   }
@@ -399,8 +434,45 @@ class AudioEngine {
       track,
       _snapshot.replayGainSettings,
     );
-    await _postProcessor.setReplayGain(gain);
+    if (_isNativePlayer) {
+      final native = (_backend as MiniaudioBackend).nativePlayer;
+      native.setReplayGain(gain);
+    } else {
+      await _postProcessor.setReplayGain(gain);
+    }
     _emit(_snapshot.copyWith(appliedReplayGainDb: gain));
+  }
+
+  /// Push the current [EqualizerSettings] to the native miniaudio player.
+  Future<void> _applyNativeEqualizer(EqualizerSettings settings) async {
+    if (!_isNativePlayer) return;
+    final native = (_backend as MiniaudioBackend).nativePlayer;
+    // 10-band gains
+    final gains = EqualizerBand.values
+        .map((b) => settings.gainsDb[b] ?? 0.0)
+        .toList();
+    native.setEqualizerBands(gains);
+    // Bass / treble shelf
+    native.setBassBoost(settings.bassBoostEnabled, settings.bassBoostDb);
+    native.setTrebleBoost(settings.trebleBoostEnabled, settings.trebleBoostDb);
+  }
+
+  Future<void> _applyFadeIn(Duration duration) async {
+    if (_isNativePlayer) {
+      final native = (_backend as MiniaudioBackend).nativePlayer;
+      native.fadeIn(duration);
+    } else {
+      await _postProcessor.fadeIn(duration);
+    }
+  }
+
+  Future<void> _applyFadeOut(Duration duration) async {
+    if (_isNativePlayer) {
+      final native = (_backend as MiniaudioBackend).nativePlayer;
+      native.fadeOut(duration);
+    } else {
+      await _postProcessor.fadeOut(duration);
+    }
   }
 
   Future<void> _configureBackendMode(PlaybackMode mode) async {

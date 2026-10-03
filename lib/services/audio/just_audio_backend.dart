@@ -1,12 +1,15 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:just_audio/just_audio.dart';
 
 import 'audio_engine_backend.dart';
 import 'audio_track.dart';
+import 'local_media_server.dart';
 
 class JustAudioBackend implements AudioEngineBackend {
-  JustAudioBackend({AudioPlayer? player}) : _player = player ?? AudioPlayer() {
+  JustAudioBackend({AudioPlayer? player})
+      : _player = player ?? AudioPlayer() {
     _subscriptions.add(_player.playerStateStream.listen(_onPlayerState));
     _subscriptions.add(
       _player.positionStream.listen((position) {
@@ -30,14 +33,17 @@ class JustAudioBackend implements AudioEngineBackend {
     );
     _subscriptions.add(
       _player.errorStream.listen((error) {
+        print('[JustAudioBackend] Error stream: $error');
         _emit(BackendEvent.error(error));
       }),
     );
+    _serverReady = LocalMediaServer.instance.start();
   }
 
   final AudioPlayer _player;
   final _events = StreamController<BackendEvent>.broadcast();
   final List<StreamSubscription<Object?>> _subscriptions = [];
+  late final Future<void> _serverReady;
   bool _disposed = false;
 
   @override
@@ -50,18 +56,38 @@ class JustAudioBackend implements AudioEngineBackend {
     Duration initialPosition = Duration.zero,
   }) async {
     _ensureActive();
-    final sources = tracks
-        .map((track) => AudioSource.uri(Uri.file(track.filePath)))
-        .toList(growable: false);
+    await _serverReady;
+    final sources = <AudioSource>[];
+    for (final track in tracks) {
+      try {
+        final file = File(track.filePath);
+        if (await file.exists()) {
+          final uri = LocalMediaServer.instance.fileToUri(track.filePath);
+          print('[JustAudioBackend] URI: $uri');
+          sources.add(AudioSource.uri(uri));
+        } else {
+          print('[JustAudioBackend] File not found: ${track.filePath}');
+          sources.add(AudioSource.uri(Uri.parse('')));
+        }
+      } catch (e) {
+        print('[JustAudioBackend] Error creating source: $e');
+        sources.add(AudioSource.uri(Uri.parse('')));
+      }
+    }
+    print('[JustAudioBackend] Setting ${sources.length} audio sources, initialIndex: $initialIndex');
     await _player.setAudioSources(
       sources,
       initialIndex: initialIndex,
       initialPosition: initialPosition,
     );
+    print('[JustAudioBackend] Audio sources set successfully');
   }
 
   @override
-  Future<void> play() => _player.play();
+  Future<void> play() {
+    print('[JustAudioBackend] play() called, currentIndex: ${_player.currentIndex}');
+    return _player.play();
+  }
 
   @override
   Future<void> pause() => _player.pause();
@@ -104,6 +130,7 @@ class JustAudioBackend implements AudioEngineBackend {
     }
     await _player.dispose();
     await _events.close();
+    await LocalMediaServer.instance.stop();
   }
 
   void _onPlayerState(PlayerState playerState) {
